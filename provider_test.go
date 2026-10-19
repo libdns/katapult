@@ -2,330 +2,320 @@ package katapult
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
-	"os"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/libdns/libdns"
 )
 
-var (
-	envToken = ""
-	envZone  = ""
-)
+const testZone = "example.com."
 
-func provisionRecords(t *testing.T, provider *Provider, zone string, recordsToProvision []libdns.Record, recordsToTest []libdns.Record) []libdns.Record {
+// fakeKatapult is an in-memory stand-in for the parts of the Katapult DNS API the provider uses.
+type fakeKatapult struct {
+	mu      sync.Mutex
+	nextID  int
+	records []DNSRecord
+	calls   []string
+}
+
+func newFakeKatapult(t *testing.T, records ...DNSRecord) *fakeKatapult {
 	t.Helper()
 
-	provisionedRecords, err := provider.AppendRecords(context.Background(), zone, recordsToProvision)
-	if err != nil {
-		t.Fatalf("failed to create records: %v", err)
+	f := &fakeKatapult{records: records, nextID: 100}
+	server := httptest.NewServer(f)
+	t.Cleanup(server.Close)
+
+	previous := baseURL
+	baseURL = server.URL
+	t.Cleanup(func() { baseURL = previous })
+
+	return f
+}
+
+func (f *fakeKatapult) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls = append(f.calls, r.Method)
+
+	if r.Header.Get("Authorization") != "Bearer token" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusForbidden)
+		return
 	}
 
-	if len(provisionedRecords) > 0 {
-		// Replace placeholder IDs of any existing records to test with a real ID from the provision
-		for i, record := range recordsToTest {
-			if record.ID != "" {
-				recordsToTest[i].ID = provisionedRecords[0].ID
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/dns_zones/_/records":
+		if got := r.URL.Query().Get("dns_zone[name]"); got != "example.com" {
+			http.Error(w, "unknown zone "+got, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(DNSRecordsAPIResponse{DNSRecords: f.records})
+
+	case r.Method == http.MethodPost && r.URL.Path == "/dns_zones/_/records":
+		var body struct {
+			Properties struct {
+				Name     string                     `json:"name"`
+				Type     string                     `json:"type"`
+				TTL      *int                       `json:"ttl"`
+				Priority *uint16                    `json:"priority"`
+				Content  map[string]json.RawMessage `json:"content"`
+			} `json:"properties"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		props := body.Properties
+
+		f.nextID++
+		record := DNSRecord{
+			ID:       fmt.Sprintf("dnsrec_%d", f.nextID),
+			Type:     props.Type,
+			Name:     props.Name,
+			FullName: strings.TrimPrefix(props.Name+".example.com", "."),
+			TTL:      3600,
+		}
+		if props.TTL != nil {
+			record.TTL = *props.TTL
+		}
+		if props.Priority != nil {
+			record.Priority = *props.Priority
+		}
+
+		// Content attributes are returned in the same shape they're sent.
+		attrs, _ := json.Marshal(props.Content)
+		if err := json.Unmarshal(attrs, &record.ContentAttributes); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		f.records = append(f.records, record)
+		json.NewEncoder(w).Encode(DNSRecordAPIResponse{DNSRecord: record})
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/dns_records/"):
+		id := strings.TrimPrefix(r.URL.Path, "/dns_records/")
+		for i, record := range f.records {
+			if record.ID == id {
+				f.records = append(f.records[:i], f.records[i+1:]...)
+				json.NewEncoder(w).Encode(DeletionAPIResponse{Deleted: true})
+				return
 			}
 		}
-	}
+		http.Error(w, `{"error":"dns_record_not_found"}`, http.StatusNotFound)
 
-	return provisionedRecords
+	default:
+		http.Error(w, "unexpected request "+r.Method+" "+r.URL.Path, http.StatusNotImplemented)
+	}
 }
 
-func cleanupRecords(t *testing.T, provider *Provider, records []libdns.Record) {
+func txtRecord(id, name, content string) DNSRecord {
+	return DNSRecord{
+		ID:                id,
+		Type:              "TXT",
+		Name:              name,
+		FullName:          strings.TrimPrefix(name+".example.com", "."),
+		TTL:               60,
+		Content:           `"` + content + `"`,
+		ContentAttributes: ContentAttributes{TXT: &TXTContent{Content: content}},
+	}
+}
+
+func rrs(records []libdns.Record) []libdns.RR {
+	out := make([]libdns.RR, len(records))
+	for i, r := range records {
+		out[i] = r.RR()
+		out[i].TTL = out[i].TTL.Truncate(time.Second)
+	}
+	return out
+}
+
+func assertRRs(t *testing.T, got []libdns.Record, want ...libdns.RR) {
 	t.Helper()
 
-	_, err := provider.DeleteRecords(context.Background(), envZone, records)
+	gotRRs := rrs(got)
+	if len(gotRRs) != len(want) {
+		t.Fatalf("expected %d records, got %d: %+v", len(want), len(gotRRs), gotRRs)
+	}
+	for i := range want {
+		if gotRRs[i] != want[i] {
+			t.Errorf("record %d: expected %+v, got %+v", i, want[i], gotRRs[i])
+		}
+	}
+}
+
+func TestGetRecordsConvertsTypes(t *testing.T) {
+	newFakeKatapult(t,
+		DNSRecord{ID: "1", Type: "A", Name: "", FullName: "example.com", TTL: 300,
+			ContentAttributes: ContentAttributes{A: &AddressContent{IPAddress: "192.0.2.1"}}},
+		DNSRecord{ID: "2", Type: "AAAA", Name: "www", FullName: "www.example.com", TTL: 300,
+			ContentAttributes: ContentAttributes{AAAA: &AddressContent{IPAddress: "2001:db8::1"}}},
+		DNSRecord{ID: "3", Type: "MX", Name: "", FullName: "example.com", TTL: 3600, Priority: 10,
+			ContentAttributes: ContentAttributes{MX: &HostnameContent{Hostname: "mail.example.net"}}},
+		DNSRecord{ID: "4", Type: "SRV", Name: "_sip._tcp", FullName: "_sip._tcp.example.com", TTL: 3600, Priority: 5,
+			ContentAttributes: ContentAttributes{SRV: &SRVContent{Weight: 10, Port: 5060, Target: "sip.example.net"}}},
+		DNSRecord{ID: "5", Type: "CAA", Name: "", FullName: "example.com", TTL: 3600,
+			ContentAttributes: ContentAttributes{CAA: &CAAContent{Flag: 0, Tag: "issue", Value: "letsencrypt.org"}}},
+		DNSRecord{ID: "6", Type: "ALIAS", Name: "", FullName: "example.com", TTL: 3600, Content: "lb.example.net"},
+		txtRecord("7", "_acme-challenge", "token"),
+	)
+
+	p := &Provider{APIToken: "token"}
+	records, err := p.GetRecords(context.Background(), testZone)
 	if err != nil {
-		t.Fatalf("failed to delete records: %v", err)
-	}
-}
-
-func assertErrorIs(t *testing.T, actual, expected error) {
-	t.Helper()
-
-	if expected == nil {
-		if actual != nil {
-			t.Fatalf("expected no error, but got: %v", actual)
-		}
-	} else {
-		if !errors.Is(actual, expected) {
-			t.Fatalf("expected error %v, but got: %v", expected, actual)
-		}
-	}
-}
-
-func assertRecordListsEqual(t *testing.T, actual, expected []libdns.Record) {
-	t.Helper()
-
-	if len(actual) != len(expected) {
-		t.Fatalf("expected %d records, but got %d", len(expected), len(actual))
+		t.Fatal(err)
 	}
 
-	for i := range expected {
-		if actual[i].ID == "" {
-			t.Fatalf("expected record ID to be present, but got nil")
-		}
-		if actual[i].Type != expected[i].Type {
-			t.Fatalf("expected record Type %s, but got %s", expected[i].Type, actual[i].Type)
-		}
-		if actual[i].Name != expected[i].Name {
-			t.Fatalf("expected record Name %s, but got %s", expected[i].Name, actual[i].Name)
-		}
-		if actual[i].Value != expected[i].Value {
-			t.Fatalf("expected record Value %s, but got %s", expected[i].Value, actual[i].Value)
-		}
-		if actual[i].TTL != expected[i].TTL {
-			t.Fatalf("expected record TTL %v, but got %v", expected[i].TTL, actual[i].TTL)
-		}
-		if actual[i].Priority != expected[i].Priority {
-			t.Fatalf("expected record Priority %d, but got %d", expected[i].Priority, actual[i].Priority)
-		}
+	assertRRs(t, records,
+		libdns.RR{Name: "@", TTL: 300 * time.Second, Type: "A", Data: "192.0.2.1"},
+		libdns.RR{Name: "www", TTL: 300 * time.Second, Type: "AAAA", Data: "2001:db8::1"},
+		libdns.RR{Name: "@", TTL: time.Hour, Type: "MX", Data: "10 mail.example.net"},
+		libdns.RR{Name: "_sip._tcp", TTL: time.Hour, Type: "SRV", Data: "5 10 5060 sip.example.net"},
+		libdns.RR{Name: "@", TTL: time.Hour, Type: "CAA", Data: `0 issue "letsencrypt.org"`},
+		libdns.RR{Name: "@", TTL: time.Hour, Type: "ALIAS", Data: "lb.example.net"},
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "token"},
+	)
+
+	if _, ok := records[0].(libdns.Address); !ok {
+		t.Errorf("expected A record to be a libdns.Address, got %T", records[0])
 	}
-}
-
-func TestGetRecords(t *testing.T) {
-	input := map[string]struct {
-		zone               string
-		recordsToProvision []libdns.Record
-		expectedRecords    []libdns.Record
-		expectedErr        error
-	}{
-		"Success": {
-			zone: envZone + ".",
-			recordsToProvision: []libdns.Record{
-				{
-					Type:  "A",
-					Name:  "example.com",
-					Value: "127.0.0.1",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-			expectedRecords: []libdns.Record{
-				{
-					Type:     "A",
-					Name:     "example.com",
-					Value:    "127.0.0.1",
-					TTL:      time.Duration(300) * time.Second,
-					Priority: 0,
-				},
-			},
-		},
-		"API Error": {
-			zone:        "_",
-			expectedErr: errUnexpectedStatusCode,
-		},
-	}
-
-	for name, data := range input {
-		t.Run(name, func(t *testing.T) {
-			provider := &Provider{APIToken: envToken}
-			resultFromProvision := provisionRecords(t, provider, data.zone, data.recordsToProvision, []libdns.Record{})
-			defer cleanupRecords(t, provider, resultFromProvision)
-
-			records, err := provider.GetRecords(context.Background(), data.zone)
-			assertErrorIs(t, err, data.expectedErr)
-			assertRecordListsEqual(t, records, data.expectedRecords)
-		})
+	if id := records[6].(libdns.TXT).ProviderData; id != "7" {
+		t.Errorf("expected ProviderData to hold the record ID, got %v", id)
 	}
 }
 
 func TestAppendRecords(t *testing.T) {
-	input := map[string]struct {
-		zone            string
-		recordsToAdd    []libdns.Record
-		expectedRecords []libdns.Record
-		expectedErr     error
-	}{
-		"Success": {
-			zone: envZone + ".",
-			recordsToAdd: []libdns.Record{
-				{
-					Type:  "CNAME",
-					Name:  "test",
-					Value: "test",
-				},
-			},
-			expectedRecords: []libdns.Record{
-				{
-					Type:  "CNAME",
-					Name:  "test",
-					Value: "test." + envZone,
-					TTL:   time.Duration(0) * time.Second,
-				},
-			},
-		},
-		"API Error": {
-			zone: "_",
-			recordsToAdd: []libdns.Record{
-				{
-					Type:  "CNAME",
-					Name:  "test",
-					Value: "test",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-			expectedErr: errUnexpectedStatusCode,
-		},
+	f := newFakeKatapult(t)
+	p := &Provider{APIToken: "token"}
+
+	added, err := p.AppendRecords(context.Background(), testZone, []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", TTL: 10 * time.Second, Text: "abc"},
+		libdns.Address{Name: "@", IP: netip.MustParseAddr("192.0.2.1")},
+		libdns.MX{Name: "@", TTL: time.Hour, Preference: 20, Target: "mx.example.net"},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for name, data := range input {
-		t.Run(name, func(t *testing.T) {
-			provider := &Provider{APIToken: envToken}
-			addedRecords, err := provider.AppendRecords(context.Background(), data.zone, data.recordsToAdd)
-			defer cleanupRecords(t, provider, addedRecords)
-			assertErrorIs(t, err, data.expectedErr)
-			assertRecordListsEqual(t, addedRecords, data.expectedRecords)
-		})
+	assertRRs(t, added,
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "abc"},
+		libdns.RR{Name: "@", TTL: time.Hour, Type: "A", Data: "192.0.2.1"},
+		libdns.RR{Name: "@", TTL: time.Hour, Type: "MX", Data: "20 mx.example.net"},
+	)
+
+	if f.records[1].Name != "" {
+		t.Errorf("expected apex to be sent as a blank name, got %q", f.records[1].Name)
+	}
+	if f.records[2].Priority != 20 {
+		t.Errorf("expected MX priority to be sent, got %d", f.records[2].Priority)
 	}
 }
 
-func TestSetRecords(t *testing.T) {
-	input := map[string]struct {
-		zone               string
-		recordsToProvision []libdns.Record
-		recordsToSet       []libdns.Record
-		expectedRecords    []libdns.Record
-		expectedErr        error
-	}{
-		"Success": {
-			zone: envZone + ".",
-			recordsToProvision: []libdns.Record{
-				{
-					Type:  "A",
-					Name:  "testrecord.com",
-					Value: "0.0.0.0",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-			recordsToSet: []libdns.Record{
-				{
-					ID:    "existingrecord", // here we test changing the type and value of the existing record
-					Type:  "TXT",
-					Name:  "testrecord.com",
-					Value: "hello",
-					TTL:   time.Duration(300) * time.Second,
-				},
-				{
-					Type:  "A",
-					Name:  "newrecord.com",
-					Value: "0.0.0.0",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-			expectedRecords: []libdns.Record{
-				{
-					Type:  "TXT",
-					Name:  "testrecord.com",
-					Value: "hello",
-					TTL:   time.Duration(300) * time.Second,
-				},
-				{
-					Type:  "A",
-					Name:  "newrecord.com",
-					Value: "0.0.0.0",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-		},
-		"API Error": {
-			zone: "_",
-			recordsToSet: []libdns.Record{
-				{
-					Type:  "A",
-					Name:  "newrecord.com",
-					Value: "0.0.0.0",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-			expectedErr: errUnexpectedStatusCode,
-		},
-	}
+func TestAppendRecordsRejectsUnsupportedTypes(t *testing.T) {
+	newFakeKatapult(t)
+	p := &Provider{APIToken: "token"}
 
-	for name, data := range input {
-		t.Run(name, func(t *testing.T) {
-			provider := &Provider{APIToken: envToken}
-			provisionRecords(t, provider, data.zone, data.recordsToProvision, data.recordsToSet)
-
-			updatedRecords, err := provider.SetRecords(context.Background(), data.zone, data.recordsToSet)
-			defer cleanupRecords(t, provider, updatedRecords)
-			assertErrorIs(t, err, data.expectedErr)
-			assertRecordListsEqual(t, updatedRecords, data.expectedRecords)
-		})
+	_, err := p.AppendRecords(context.Background(), testZone, []libdns.Record{
+		libdns.RR{Name: "@", Type: "HTTPS", Data: `1 . alpn="h2"`},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported record type") {
+		t.Fatalf("expected unsupported record type error, got %v", err)
 	}
 }
 
-func TestDeleteRecords(t *testing.T) {
-	input := map[string]struct {
-		zone               string
-		recordsToProvision []libdns.Record
-		recordsToDelete    []libdns.Record
-		expectedRecords    []libdns.Record
-		expectedErr        error
-	}{
-		"Success": {
-			zone: envZone + ".",
-			recordsToProvision: []libdns.Record{
-				{
-					Type:  "A",
-					Name:  "testrecord.com",
-					Value: "0.0.0.0",
-					TTL:   time.Duration(300) * time.Second,
-				},
-			},
-			recordsToDelete: []libdns.Record{
-				{
-					ID:   "existingrecord",
-					Type: "A",
-					Name: "testrecord.com",
-				},
-			},
-			expectedRecords: []libdns.Record{
-				{
-					Type: "A",
-					Name: "testrecord.com",
-				},
-			},
-		},
-		"API Error": {
-			zone: "_",
-			recordsToDelete: []libdns.Record{
-				{
-					ID:   "existingrecord",
-					Type: "A",
-					Name: "example.com",
-				},
-			},
-			expectedErr: errUnexpectedStatusCode,
-		},
+func TestSetRecordsReplacesOnlyMatchingNameAndType(t *testing.T) {
+	f := newFakeKatapult(t,
+		txtRecord("1", "_acme-challenge", "old"),
+		txtRecord("2", "_acme-challenge", "keep"),
+		txtRecord("3", "other", "untouched"),
+		DNSRecord{ID: "4", Type: "CNAME", Name: "_acme-challenge", FullName: "_acme-challenge.example.com", TTL: 60,
+			ContentAttributes: ContentAttributes{CNAME: &HostnameContent{Hostname: "elsewhere.example.net"}}},
+	)
+	p := &Provider{APIToken: "token"}
+
+	set, err := p.SetRecords(context.Background(), testZone, []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", TTL: time.Minute, Text: "keep"},
+		libdns.TXT{Name: "_acme-challenge", TTL: time.Minute, Text: "new"},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for name, data := range input {
-		t.Run(name, func(t *testing.T) {
-			provider := &Provider{APIToken: envToken}
-			provisionRecords(t, provider, data.zone, data.recordsToProvision, data.recordsToDelete)
+	assertRRs(t, set,
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "keep"},
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "new"},
+	)
 
-			deletedRecords, err := provider.DeleteRecords(context.Background(), data.zone, data.recordsToDelete)
-			assertErrorIs(t, err, data.expectedErr)
-			assertRecordListsEqual(t, deletedRecords, data.expectedRecords)
-		})
+	remaining, _ := p.GetRecords(context.Background(), testZone)
+	assertRRs(t, remaining,
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "keep"},
+		libdns.RR{Name: "other", TTL: time.Minute, Type: "TXT", Data: "untouched"},
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "CNAME", Data: "elsewhere.example.net"},
+		libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "new"},
+	)
+
+	if f.records[0].ID != "2" {
+		t.Errorf("expected the unchanged record to be kept rather than recreated, got ID %s", f.records[0].ID)
 	}
 }
 
-func TestMain(m *testing.M) {
-	envToken = os.Getenv("LIBDNS_KATAPULT_API_TOKEN")
-	envZone = os.Getenv("LIBDNS_KATAPULT_ZONE")
+func TestDeleteRecordsMatching(t *testing.T) {
+	newFakeKatapult(t,
+		txtRecord("1", "_acme-challenge", "one"),
+		txtRecord("2", "_acme-challenge", "two"),
+		txtRecord("3", "www", "three"),
+	)
+	p := &Provider{APIToken: "token"}
 
-	if len(envToken) == 0 || len(envZone) == 0 {
-		fmt.Println(`Please note that these tests use the Katapult API.
-		You should create a new and empty domain/zone to avoid modifying any production data.
-		Specify 'LIBDNS_KATAPULT_API_TOKEN' and 'LIBDNS_KATAPULT_ZONE' to continue.`)
-		os.Exit(1)
+	deleted, err := p.DeleteRecords(context.Background(), testZone, []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", Text: "one"},
+		libdns.TXT{Name: "_acme-challenge", Text: "missing"},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertRRs(t, deleted, libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "one"})
 
-	os.Exit(m.Run())
+	// An empty type and value act as wildcards.
+	deleted, err = p.DeleteRecords(context.Background(), testZone, []libdns.Record{
+		libdns.RR{Name: "www"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRRs(t, deleted, libdns.RR{Name: "www", TTL: time.Minute, Type: "TXT", Data: "three"})
+
+	remaining, _ := p.GetRecords(context.Background(), testZone)
+	assertRRs(t, remaining, libdns.RR{Name: "_acme-challenge", TTL: time.Minute, Type: "TXT", Data: "two"})
+}
+
+func TestDeleteRecordsRespectsTTL(t *testing.T) {
+	newFakeKatapult(t, txtRecord("1", "_acme-challenge", "one"))
+	p := &Provider{APIToken: "token"}
+
+	deleted, err := p.DeleteRecords(context.Background(), testZone, []libdns.Record{
+		libdns.TXT{Name: "_acme-challenge", TTL: time.Hour, Text: "one"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("expected no records deleted when TTL differs, got %+v", rrs(deleted))
+	}
+}
+
+func TestAPIErrorsAreReturned(t *testing.T) {
+	newFakeKatapult(t)
+	p := &Provider{APIToken: "wrong"}
+
+	_, err := p.GetRecords(context.Background(), testZone)
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expected a 403 error, got %v", err)
+	}
 }

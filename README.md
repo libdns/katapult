@@ -20,10 +20,16 @@ The example can be modified to try different functions available on the provider
 
 ## Tests
 
-The tests use the Katapult API, therefore you should create and use a new and empty domain/zone.
-
-You can then set the API token and zone when running the tests:
+The unit tests run against an in-memory fake of the Katapult API, so need no credentials:
 
 ```
-LIBDNS_KATAPULT_API_TOKEN=your-api-token LIBDNS_KATAPULT_ZONE=your-domain go test
+go test ./...
 ```
+
+There are also integration tests which use the real Katapult API. These create and remove records under `libdns-test` in the zone, so you should use a test domain/zone:
+
+```
+LIBDNS_KATAPULT_API_TOKEN=your-api-token LIBDNS_KATAPULT_ZONE=your-domain go test -tags integration -run Integration -v
+```
+
+API tokens restricted to ACME challenges can only manage `_acme-challenge` TXT records; tests for other record types are skipped when using one.

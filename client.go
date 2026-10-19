@@ -14,13 +14,10 @@ import (
 var baseURL = "https://api.katapult.io/core/v1"
 var errUnexpectedStatusCode = errors.New("unexpected status code")
 
-// NewHTTPClient returns a configured HTTP client.
-func NewHTTPClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Second}
-}
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // DoRequest performs an HTTP request and decodes the response.
-func (p *Provider) DoRequest(ctx context.Context, method, url string, body interface{}, response interface{}) error {
+func (p *Provider) DoRequest(ctx context.Context, method, url string, body any, response any) error {
 	var reqBody []byte
 	var err error
 	if body != nil {
@@ -40,14 +37,13 @@ func (p *Provider) DoRequest(ctx context.Context, method, url string, body inter
 	req.Header.Set("Authorization", "Bearer "+p.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := NewHTTPClient()
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return fmt.Errorf("failed to read response body: %w", err)
